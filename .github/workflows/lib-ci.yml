@@ -1,0 +1,44 @@
+name: lib-ci
+
+# Reusable: tests (y lo que el alias incluya, p. ej. MiMa) de una librería sbt.
+#   jobs:
+#     ci:
+#       uses: zistemas/ci/.github/workflows/lib-ci.yml@v1
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        type: string
+        default: "21"
+      sbt-command:
+        description: Comando sbt a ejecutar
+        type: string
+        default: unitTests
+    secrets:
+      NEXUS_USER:
+        required: true
+      NEXUS_PASSWORD:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TZ: America/Montevideo   # hay tests que dependen de la zona horaria
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: sbt
+      - uses: sbt/setup-sbt@v1
+      - run: sbt ${{ inputs.sbt-command }}
