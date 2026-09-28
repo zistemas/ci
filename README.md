@@ -14,6 +14,7 @@ alcanza con `GITHUB_TOKEN`.
 | Workflow | Qué hace |
 |---|---|
 | [`lib-ci.yml`](.github/workflows/lib-ci.yml) | Ejecuta `sbt <sbt-command>` (default `unitTests`) con JDK `java-version` (default `21`) y los secrets `NEXUS_*` |
+| [`lib-release.yml`](.github/workflows/lib-release.yml) | Si hubo cambios de código (`*.sbt`, `*.scala`, salvo `version.sbt`) desde el último tag `v*`, o con `force-release`: `sbt "release with-defaults"` desde `main` (lo que haga el `releaseProcess`) y GitHub release con `--generate-notes`. El caller debe dar `permissions: contents: write` |
 
 ## Uso
 

@@ -1,0 +1,106 @@
+name: lib-release
+
+# Reusable: release de una librería sbt desde main con sbt-release, más el GitHub release.
+# Los pasos (tests, MiMa, tag, publicación en Nexus, push) los define el releaseProcess del build.sbt.
+#   jobs:
+#     release:
+#       uses: zistemas/ci/.github/workflows/lib-release.yml@v1
+#       permissions:
+#         contents: write
+#       with:
+#         force-release: ${{ inputs.force-release || false }}
+#       secrets:
+#         NEXUS_USER: ${{ secrets.NEXUS_USER }}
+#         NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        type: string
+        default: "21"
+      force-release:
+        description: Publicar aunque no haya cambios de código desde el último tag
+        type: boolean
+        default: false
+    secrets:
+      NEXUS_USER:
+        required: true
+      NEXUS_PASSWORD:
+        required: true
+
+# Un cron y un dispatch manual cruzados no deben intentar publicar la misma versión dos veces.
+concurrency:
+  group: lib-release-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.changes.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: changes
+        env:
+          FORCE: ${{ inputs.force-release }}
+        run: |
+          if [ "$FORCE" = "true" ]; then
+            echo "force-release: se publica sin mirar cambios"
+            echo "release=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          last_tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)
+          if [ -z "$last_tag" ]; then
+            echo "Sin tags de release previos"
+            echo "release=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --quiet "$last_tag" HEAD -- '*.sbt' '*.scala' ':(exclude)version.sbt' ':(exclude)*/version.sbt'; then
+            echo "Sin cambios de código desde $last_tag"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Hay cambios de código desde $last_tag"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: check
+    if: needs.check.outputs.release == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      TZ: America/Montevideo   # hay tests que dependen de la zona horaria
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: sbt
+      - uses: sbt/setup-sbt@v1
+      - name: Verificar permiso de push
+        # sbt-release publica en Nexus antes de pushear: si el push fallara después, la versión
+        # quedaría en Nexus sin tag ni commit en GitHub. Esto falla antes de publicar nada.
+        run: git push --dry-run origin HEAD:${{ github.ref_name }}
+      - name: sbt release
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          sbt "release with-defaults"
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*')
+          gh release create "$tag" --verify-tag --generate-notes --title "$tag"
