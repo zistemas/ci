@@ -15,6 +15,7 @@ alcanza con `GITHUB_TOKEN`.
 |---|---|
 | [`lib-ci.yml`](.github/workflows/lib-ci.yml) | Ejecuta `sbt <sbt-command>` (default `unitTests`) con JDK `java-version` (default `21`) y los secrets `NEXUS_*` |
 | [`lib-release.yml`](.github/workflows/lib-release.yml) | Si hubo cambios de código (`*.sbt`, `*.scala`, salvo `version.sbt`) desde el último tag `v*`, o con `force-release`: `sbt "release with-defaults"` desde `main` (lo que haga el `releaseProcess`) y GitHub release con `--generate-notes`. El caller debe dar `permissions: contents: write` |
+| [`lib-release-hotfix.yml`](.github/workflows/lib-release-hotfix.yml) | Hotfix desde una rama de mantenimiento `release/*` (disparado a mano): exige `version.sbt` en `X.Y.Z-SNAPSHOT`, corre `sbt <sbt-command>` (default `release-hotfix`: tests, tag y Nexus según el `build.sbt`), pushea rama y tag, y crea el GitHub release con notas desde el tag anterior de la rama. Comparte el grupo de `concurrency` con `lib-release`. El caller debe dar `permissions: contents: write` |
 
 ## Uso
 
