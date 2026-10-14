@@ -1,0 +1,95 @@
+name: lib-release-hotfix
+
+# Reusable: release de un hotfix de una librería sbt desde una rama de mantenimiento `release/*`
+# (p. ej. `release/v4` mientras `main` avanza a la próxima mayor), más el GitHub release.
+#
+# Flujo esperado en la lib:
+#   1. El PR del hotfix a `release/vN` sube `version.sbt` a `X.Y.Z-SNAPSHOT`.
+#   2. Después del merge, `make-release` se dispara a mano sobre `release/vN`.
+#   3. `sbt <sbt-command>` (default `release-hotfix`: tests, versión, commit, tag y publicación en Nexus,
+#      sin next version ni push, según el build.sbt) y después este workflow pushea rama y tag.
+#
+#   jobs:
+#     release-hotfix:
+#       if: startsWith(github.ref, 'refs/heads/release/')
+#       uses: zistemas/ci/.github/workflows/lib-release-hotfix.yml@v1
+#       permissions:
+#         contents: write
+#       secrets:
+#         NEXUS_USER: ${{ secrets.NEXUS_USER }}
+#         NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        type: string
+        default: "21"
+      sbt-command:
+        description: Comando sbt que hace el release del hotfix
+        type: string
+        default: release-hotfix
+    secrets:
+      NEXUS_USER:
+        required: true
+      NEXUS_PASSWORD:
+        required: true
+
+# Mismo grupo que lib-release: nunca dos releases de la misma lib en paralelo.
+concurrency:
+  group: lib-release-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    if: startsWith(github.ref, 'refs/heads/release/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      TZ: America/Montevideo   # hay tests que dependen de la zona horaria
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verificar versión SNAPSHOT
+        # Sin el bump a X.Y.Z-SNAPSHOT, sbt-release reusaría la versión ya publicada.
+        run: |
+          if ! grep -q -- '-SNAPSHOT' version.sbt; then
+            echo "::error::version.sbt no es SNAPSHOT ($(cat version.sbt)). El PR del hotfix tiene que subirla a X.Y.Z-SNAPSHOT."
+            exit 1
+          fi
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: sbt
+      - uses: sbt/setup-sbt@v1
+      - name: Verificar permiso de push
+        # El release publica en Nexus antes de pushear: si el push fallara después, la versión
+        # quedaría en Nexus sin tag ni commit en GitHub. Esto falla antes de publicar nada.
+        run: git push --dry-run origin HEAD:${{ github.ref_name }}
+      - name: sbt release hotfix
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          sbt ${{ inputs.sbt-command }}
+      - name: Push de rama y tag
+        run: |
+          tag=$(git describe --tags --exact-match --match 'v[0-9]*' HEAD)
+          git push origin HEAD:${{ github.ref_name }}
+          git push origin "$tag"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$TAG^" 2>/dev/null || true)
+          gh release create "$TAG" --verify-tag --generate-notes --title "$TAG" \
+            ${previous:+--notes-start-tag "$previous"}
