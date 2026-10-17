@@ -1,0 +1,79 @@
+name: app-start-release
+
+# Reusable: abre `release/vX.Y.Z` desde el HEAD de `develop` para una aplicación (ciclo de app-publish).
+# Versión por defecto: la misma que vienen mostrando los snapshots de develop (último tag final vX.Y.Z + bump de
+# .github/next-bump). `version` la pisa (ej. el primer release de un repo cuyas milestones ya iban adelante).
+# El push lo hace GITHUB_TOKEN, que no dispara otros workflows: el primer rc.NNN sale con el primer push a la rama.
+#   jobs:
+#     start-release:
+#       uses: zistemas/ci/.github/workflows/app-start-release.yml@v1
+#       permissions:
+#         contents: write
+#       with:
+#         version: ${{ inputs.version }}
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Versión X.Y.Z (vacío = último final + .github/next-bump)
+        type: string
+        default: ""
+    outputs:
+      version:
+        description: Versión del release abierto, sin la v
+        value: ${{ jobs.start-release.outputs.version }}
+
+concurrency:
+  group: app-release-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  start-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: develop
+          fetch-depth: 0
+      - id: release
+        name: Abrir release/vX.Y.Z
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          last=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+          if [ -n "$VERSION" ]; then
+            version=${VERSION#v}
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version debe ser X.Y.Z: '$VERSION'"; exit 1; }
+          else
+            IFS=. read -r ma mi pa <<< "${last:-v0.0.0}"
+            ma=${ma#v}
+            bump=$(tr -d '[:space:]' < .github/next-bump 2>/dev/null || echo minor)
+            case "$bump" in
+              major) version="$((ma + 1)).0.0" ;;
+              minor) version="$ma.$((mi + 1)).0" ;;
+              patch) version="$ma.$mi.$((pa + 1))" ;;
+              *) echo "::error::.github/next-bump inválido: '$bump' (major|minor|patch)"; exit 1 ;;
+            esac
+          fi
+          if [ -n "$last" ]; then
+            mayor=$(printf '%s\n%s\n' "${last#v}" "$version" | sort -V | tail -1)
+            if [ "$mayor" != "$version" ] || [ "${last#v}" = "$version" ]; then
+              echo "::error::$version no es mayor que el último release final ($last)"; exit 1
+            fi
+          fi
+          branch="release/v$version"
+          git rev-parse -q --verify "refs/tags/v$version" >/dev/null && { echo "::error::ya existe el tag v$version"; exit 1; }
+          git ls-remote --exit-code --heads origin "$branch" >/dev/null && { echo "::error::ya existe la rama $branch"; exit 1; }
+          git push origin "HEAD:refs/heads/$branch"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Abierta \`$branch\` en $(git rev-parse --short HEAD) (develop). Último final: ${last:-ninguno}." >> "$GITHUB_STEP_SUMMARY"
