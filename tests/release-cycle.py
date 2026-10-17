@@ -1,4 +1,4 @@
-"""Prueba app-start-release y app-make-release: corre sus pasos `run` (extraídos del YAML real) contra un
+"""Prueba app-start-release, app-start-hotfix y app-make-release: corre sus pasos `run` (extraídos del YAML real) contra un
 repo de prueba con origin bare, y sbt y gh de mentira. No usa red ni GitHub.
 
 Uso: python3 -I tests/release-cycle.py .     (requiere git y python3-yaml)
@@ -82,15 +82,24 @@ class Repo:
             for k, v in (s.get("env") or {}).items():
                 for o in ("tag", "version", "kind"):
                     v = str(v).replace("${{ steps.version.outputs.%s }}" % o, outputs.get(o, ""))
-                v = v.replace("${{ inputs.sbt-command }}", "assembly").replace("${{ inputs.version }}", (extra_env or {}).get("VERSION", ""))
-                step_env[k] = v
-            script = s["run"].replace("${{ inputs.sbt-test-command }}", "test")
+                step_env[k] = inputs(v, extra_env)
+            script = inputs(s["run"], extra_env)
             r = subprocess.run(["bash", "-c", script], cwd=runner, env=step_env, capture_output=True, text=True)
             for l in open(out).read().splitlines():
                 k, _, v = l.partition("="); outputs[k] = v
             if r.returncode:
                 return False, ((r.stdout + r.stderr).strip().splitlines() or [f"exit {r.returncode} en: {s.get('name')}"])[-1], outputs
         return True, open(summary).read().strip().replace("\n", " | "), outputs
+
+
+DEFAULTS = {"sbt-command": "assembly", "sbt-test-command": "test", "version": "", "description": ""}
+
+
+def inputs(texto, extra_env):
+    """`${{ inputs.x-y }}` → extra_env["X_Y"] o el default del input (lo que haría GitHub con `with:`)."""
+    import re
+    return re.sub(r"\$\{\{ inputs\.([a-z-]+) \}\}",
+                  lambda m: (extra_env or {}).get(m.group(1).upper().replace("-", "_"), DEFAULTS.get(m.group(1), "")), str(texto))
 
 
 def contenido(repo, ref, archivo):
@@ -180,6 +189,37 @@ ok, msg, o = r3.correr("app-make-release.yml", "hotfix/v0.0.1-foto")
 caso("hotfix publicado como v0.0.1", ok and os.path.exists(os.path.join(r3.gh, "v0.0.1")), msg)
 caso("develop tiene el hotfix", contenido(r3, "develop", "a.txt") == "hot")
 caso("develop: next-bump sigue major", contenido(r3, "develop", ".github/next-bump") == "major")
+
+print("start-hotfix")
+h = Repo()
+ok, msg, o = h.correr("app-start-hotfix.yml", "main", {"DESCRIPTION": "fix-foto"})
+caso("sin releases finales → error", not ok and "ningún release final" in msg, msg)
+h.correr("app-start-release.yml", "develop", {"VERSION": "0.3.0"})
+h.correr("app-make-release.yml", "release/v0.3.0")
+for d in ("Fix Foto", "fix_foto", "-fix", "fix--foto", "x" * 41, ""):
+    ok, msg, o = h.correr("app-start-hotfix.yml", "main", {"DESCRIPTION": d})
+    caso(f"descripción inválida {d[:12]!r} → error", not ok and "kebab-case" in msg, msg)
+ok, msg, o = h.correr("app-start-hotfix.yml", "main", {"DESCRIPTION": "fix-foto"})
+refs = h.refs()
+caso("v0.3.0 → hotfix/v0.3.1-fix-foto", ok and "refs/heads/hotfix/v0.3.1-fix-foto" in refs, msg)
+caso("sale del commit del tag v0.3.0", refs.get("refs/heads/hotfix/v0.3.1-fix-foto") == sh("git rev-parse --short v0.3.0^{commit}", h.origin).stdout.strip())
+ok, msg, o = h.correr("app-start-hotfix.yml", "main", {"DESCRIPTION": "otro-fix"})
+caso("otro hotfix para 0.3.1 abierto → error", not ok and "ya hay un hotfix abierto" in msg, msg)
+print("start-hotfix → make-release (ciclo completo)")
+h.commit("develop", "d.txt", "feature-nueva", "feature en develop")
+sh(f"git fetch -q origin && git checkout -q -B hotfix/v0.3.1-fix-foto origin/hotfix/v0.3.1-fix-foto && echo arreglado > a.txt && git add -A && {h.g} commit -qm fix && git push -q origin hotfix/v0.3.1-fix-foto", h.work)
+ok, msg, o = h.correr("app-make-release.yml", "hotfix/v0.3.1-fix-foto")
+caso("make-release del hotfix → v0.3.1", ok and os.path.exists(os.path.join(h.gh, "v0.3.1")), msg)
+caso("main tiene el fix y NO la feature de develop", contenido(h, "main", "a.txt") == "arreglado" and contenido(h, "main", "d.txt") == "")
+caso("develop tiene el fix y su feature", contenido(h, "develop", "a.txt") == "arreglado" and contenido(h, "develop", "d.txt") == "feature-nueva")
+ok, msg, o = h.correr("app-start-hotfix.yml", "main", {"DESCRIPTION": "fix-dos"})
+caso("siguiente hotfix → v0.3.2", ok and "refs/heads/hotfix/v0.3.2-fix-dos" in h.refs(), msg)
+print("start-hotfix: main desfasado del último final")
+sh(f"git fetch -q origin && git checkout -q -B main origin/main && echo a-mano > m.txt && git add -A && {h.g} commit -qm 'push a mano' && git push -q origin main", h.work)
+sh("git push -q origin --delete hotfix/v0.3.2-fix-dos", h.work)
+ok, msg, o = h.correr("app-start-hotfix.yml", "main", {"DESCRIPTION": "fix-tres"})
+caso("error: main no coincide con v0.3.1", not ok and "main no coincide" in msg, msg)
+shutil.rmtree(h.base)
 
 print("make-release: tag existente fuera de main")
 r4 = Repo()
