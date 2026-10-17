@@ -1,0 +1,68 @@
+name: app-cleanup-snapshots
+
+# Reusable: borra los GitHub pre-releases `vX.Y.Z-snapshot.NNN` viejos de una aplicación (los crea app-publish),
+# conservando los últimos `keep` de cada versión objetivo. No toca releases finales ni RCs.
+# Borra el release (y su JAR), NO el tag: app-publish numera contando tags, así un NNN nunca se reusa
+# y una versión desplegada siempre se puede rastrear a su commit.
+#   jobs:
+#     cleanup:
+#       uses: zistemas/ci/.github/workflows/app-cleanup-snapshots.yml@v1
+#       permissions:
+#         contents: write
+#       with:
+#         keep: 3
+
+on:
+  workflow_call:
+    inputs:
+      keep:
+        description: Cuántos snapshots conservar por versión objetivo
+        type: number
+        default: 3
+      dry-run:
+        description: Sólo listar lo que se borraría
+        type: boolean
+        default: false
+
+concurrency:
+  group: app-cleanup-snapshots-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      KEEP: ${{ inputs.keep }}
+      DRY_RUN: ${{ inputs.dry-run }}
+    steps:
+      - name: Borrar snapshots viejos
+        run: |
+          set -euo pipefail
+          [ "$KEEP" -ge 1 ] || { echo "::error::keep debe ser >= 1 (es $KEEP)"; exit 1; }
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName,isPrerelease > releases.json
+          jq -r --argjson keep "$KEEP" '
+            [ .[]
+              | select(.isPrerelease)
+              | (.tagName | capture("^v(?<base>[0-9]+\\.[0-9]+\\.[0-9]+)-snapshot\\.(?<n>[0-9]+)$")) as $m
+              | {tag: .tagName, base: $m.base, n: ($m.n | tonumber)} ]
+            | group_by(.base)[]
+            | sort_by(-.n)
+            | .[$keep:][]
+            | .tag' releases.json > a-borrar.txt
+          echo "### Snapshots a borrar (keep=$KEEP, dry-run=$DRY_RUN): $(wc -l < a-borrar.txt)" >> "$GITHUB_STEP_SUMMARY"
+          while read -r tag; do
+            echo "- \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$DRY_RUN" = true ]; then
+              echo "dry-run: $tag"
+            else
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes   # sin --cleanup-tag: el tag queda
+              echo "borrado: $tag"
+            fi
+          done < a-borrar.txt
