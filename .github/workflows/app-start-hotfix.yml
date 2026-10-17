@@ -1,0 +1,69 @@
+name: app-start-hotfix
+
+# Reusable: abre `hotfix/vX.Y.Z-<description>` para una aplicación (ciclo de app-publish / app-make-release).
+# Sale del tag del último release final (lo que está en producción) con su patch + 1; main tiene que coincidir con
+# ese tag. Un hotfix a la vez: si ya hay una rama hotfix/vX.Y.Z-* para esa versión, error.
+# El push lo hace GITHUB_TOKEN, que no dispara otros workflows: el primer rc.NNN sale con el primer push a la rama.
+#   jobs:
+#     start-hotfix:
+#       uses: zistemas/ci/.github/workflows/app-start-hotfix.yml@v1
+#       permissions:
+#         contents: write
+#       with:
+#         description: ${{ inputs.description }}
+
+on:
+  workflow_call:
+    inputs:
+      description:
+        description: Descripción corta en kebab-case (ej. fix-null-parser), va en el nombre de la rama
+        type: string
+        required: true
+    outputs:
+      version:
+        description: Versión del hotfix, sin la v
+        value: ${{ jobs.start-hotfix.outputs.version }}
+
+concurrency:
+  group: app-release-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  start-hotfix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.hotfix.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - id: hotfix
+        name: Abrir hotfix/vX.Y.Z-desc
+        env:
+          DESC: ${{ inputs.description }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$DESC" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || [ "${#DESC}" -gt 40 ]; then
+            echo "::error::description debe ser kebab-case ([a-z0-9] separados por -), hasta 40 caracteres: '$DESC'"; exit 1
+          fi
+          last=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+          [ -n "$last" ] || { echo "::error::no hay ningún release final del que salir"; exit 1; }
+          base=$(git rev-parse "$last^{commit}")
+          [ "$base" = "$(git rev-parse origin/main)" ] ||
+            { echo "::error::main no coincide con $last (lo último en producción): revisar qué entró a main fuera de make-release"; exit 1; }
+          IFS=. read -r ma mi pa <<< "${last#v}"
+          version="$ma.$mi.$((pa + 1))"
+          git rev-parse -q --verify "refs/tags/v$version" >/dev/null && { echo "::error::ya existe el tag v$version"; exit 1; }
+          abiertas=$(git ls-remote --heads origin "hotfix/v$version" "hotfix/v$version-*" | sed 's#.*refs/heads/##')
+          [ -z "$abiertas" ] || { echo "::error::ya hay un hotfix abierto para $version: $abiertas"; exit 1; }
+          branch="hotfix/v$version-$DESC"
+          git push origin "$base:refs/heads/$branch"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Abierta \`$branch\` desde $last ($(git rev-parse --short "$base"))." >> "$GITHUB_STEP_SUMMARY"
