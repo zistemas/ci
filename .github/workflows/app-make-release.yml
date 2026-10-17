@@ -1,0 +1,156 @@
+name: app-make-release
+
+# Reusable: cierra `release/vX.Y.Z` o `hotfix/vX.Y.Z[-desc]` de una aplicación (ciclo de app-publish).
+# Todo o nada: merge --no-ff a main, `sbt test`, tag vX.Y.Z en el merge y back-merge de main a develop se hacen en
+# el runner, y los tres refs se pushean juntos con `git push --atomic`. Si algo falla antes, no se pushea nada.
+# Después: JAR con la versión X.Y.Z, GitHub release final y borrado de la rama.
+# Re-ejecutable: si el tag ya existe y está en main, sólo completa lo que falte (release, borrado de la rama).
+# En release/** vuelve .github/next-bump a `minor` en develop (en hotfix/** no: lo pendiente en develop sigue).
+#   jobs:
+#     make-release:
+#       uses: zistemas/ci/.github/workflows/app-make-release.yml@v1
+#       permissions:
+#         contents: write
+#       secrets:
+#         NEXUS_USER: ${{ secrets.NEXUS_USER }}
+#         NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        type: string
+        default: "21"
+      sbt-test-command:
+        description: Comando sbt que valida el merge a main antes de pushear
+        type: string
+        default: test
+      sbt-command:
+        description: Comando sbt que arma el JAR (después de fijar la versión)
+        type: string
+        default: assembly
+    outputs:
+      version:
+        description: Versión publicada, sin la v
+        value: ${{ jobs.make-release.outputs.version }}
+    secrets:
+      NEXUS_USER:
+        required: true
+      NEXUS_PASSWORD:
+        required: true
+
+concurrency:
+  group: app-release-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  make-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    env:
+      TZ: America/Montevideo
+      BRANCH: ${{ github.ref_name }}
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: version
+        name: Versión y estado
+        run: |
+          set -euo pipefail
+          case "$BRANCH" in
+            release/v*) kind=release ;;
+            hotfix/v*) kind=hotfix ;;
+            *) echo "::error::make-release corre sobre release/vX.Y.Z o hotfix/vX.Y.Z[-desc], no sobre '$BRANCH'"; exit 1 ;;
+          esac
+          version=$(sed -E 's#^(release|hotfix)/v([0-9]+\.[0-9]+\.[0-9]+).*$#\2#' <<< "$BRANCH")
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::la rama no trae versión vX.Y.Z: $BRANCH"; exit 1; }
+          tag="v$version"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            git merge-base --is-ancestor "$tag" origin/main ||
+              { echo "::error::el tag $tag ya existe y no está en main: revisarlo a mano"; exit 1; }
+            resume=true
+            echo "El tag $tag ya existe en main: sólo se completa lo que falte." >> "$GITHUB_STEP_SUMMARY"
+          else
+            resume=false
+          fi
+          { echo "version=$version"; echo "tag=$tag"; echo "kind=$kind"; echo "resume=$resume"; } >> "$GITHUB_OUTPUT"
+      - id: merge-main
+        name: Merge a main (local)
+        if: steps.version.outputs.resume == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git checkout -q -B main origin/main
+          if ! git merge --no-ff --no-edit -m "release: $TAG" "origin/$BRANCH"; then
+            git merge --abort
+            echo "::error::conflicto al mergear $BRANCH a main. No se pusheó nada."; exit 1
+          fi
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: sbt
+      - uses: sbt/setup-sbt@v1
+      - name: Tests sobre el merge
+        if: steps.version.outputs.resume == 'false'
+        run: sbt ${{ inputs.sbt-test-command }}
+      - id: push
+        name: Tag, back-merge a develop y push atómico
+        if: steps.version.outputs.resume == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          KIND: ${{ steps.version.outputs.kind }}
+        run: |
+          set -euo pipefail
+          git tag -a "$TAG" -m "$TAG"
+          git checkout -q -B develop origin/develop
+          if ! git merge --no-ff --no-edit -m "chore: back-merge $TAG a develop" main; then
+            git merge --abort
+            echo "::error::conflicto en el back-merge de $TAG a develop. No se pusheó nada. Abrir un PR $BRANCH -> develop, resolverlo ahí, mergearlo y volver a correr make-release."
+            exit 1
+          fi
+          if [ "$KIND" = release ] && [ "$(tr -d '[:space:]' < .github/next-bump 2>/dev/null || echo minor)" != minor ]; then
+            echo minor > .github/next-bump
+            git add .github/next-bump
+            git commit -q --amend --no-edit
+            echo "\`.github/next-bump\` vuelve a \`minor\` en develop." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          git push --atomic origin main develop "refs/tags/$TAG"
+          echo "Pusheados main, develop y $TAG." >> "$GITHUB_STEP_SUMMARY"
+      - id: publish
+        name: JAR, GitHub release y borrado de la rama
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SBT_COMMAND: ${{ inputs.sbt-command }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "El release $TAG ya existe." >> "$GITHUB_STEP_SUMMARY"
+          else
+            git checkout -q "$TAG"
+            sbt "set ThisBuild / version := \"$VERSION\"" $SBT_COMMAND
+            shopt -s nullglob
+            jars=(target/scala-*/*-"$VERSION".jar)
+            [ "${#jars[@]}" -eq 1 ] || { echo "::error::se esperaba un JAR *-$VERSION.jar, hay ${#jars[@]}"; exit 1; }
+            gh release create "$TAG" "${jars[0]}" --verify-tag --title "$TAG" --generate-notes
+            echo "Release final $TAG publicado." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
+            git push -q origin --delete "$BRANCH"
+            echo "Rama $BRANCH borrada." >> "$GITHUB_STEP_SUMMARY"
+          fi
